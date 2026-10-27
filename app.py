@@ -1,7 +1,12 @@
 import io
-from datetime import datetime, date
+import json
+import uuid
+from datetime import datetime, date, timedelta
+
+import gspread
 import streamlit as st
 from fpdf import FPDF
+from google.oauth2.service_account import Credentials
 
 def normalizar_texto(texto):
     if not texto:
@@ -34,6 +39,232 @@ def format_money(val):
     except:
         return "R$ 0,00"
 
+
+HISTORY_SHEET_ID = "1WaIP5FJpudjKvOXw0pQe7YfJlTPrISAmaBDZswuCsxM"
+HISTORY_TAB = "Histórico de Encerramentos"
+HISTORY_HEADERS = [
+    "ID", "Versão", "Status", "Criado Em", "Atualizado Em", "Expira Em",
+    "Origem ID", "Locador", "Locatário", "Imóvel", "Data Rescisão",
+    "Tipo Resultado", "Resultado (R$)", "Dados", "Rubricas",
+]
+
+
+def data_para_texto(valor):
+    if isinstance(valor, datetime):
+        valor = valor.date()
+    return valor.isoformat() if isinstance(valor, date) else ""
+
+
+def texto_para_data(valor):
+    if not valor:
+        return None
+    try:
+        return date.fromisoformat(str(valor))
+    except ValueError:
+        return None
+
+
+@st.cache_resource(show_spinner=False)
+def planilha_historico():
+    try:
+        info = dict(st.secrets["gcp_service_account"])
+    except Exception:
+        return None
+    info["private_key"] = str(info.get("private_key", "")).replace("\\n", "\n")
+    credentials = Credentials.from_service_account_info(
+        info,
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
+    )
+    return gspread.authorize(credentials).open_by_key(HISTORY_SHEET_ID)
+
+
+def aba_historico():
+    planilha = planilha_historico()
+    if planilha is None:
+        return None
+    try:
+        aba = planilha.worksheet(HISTORY_TAB)
+    except gspread.WorksheetNotFound:
+        aba = planilha.add_worksheet(title=HISTORY_TAB, rows=1000, cols=len(HISTORY_HEADERS))
+    cabecalho = aba.row_values(1)
+    if not cabecalho:
+        aba.update("A1", [HISTORY_HEADERS])
+    else:
+        faltantes = [item for item in HISTORY_HEADERS if item not in cabecalho]
+        if faltantes:
+            inicio = len(cabecalho) + 1
+            aba.update(
+                f"{gspread.utils.rowcol_to_a1(1, inicio)}:{gspread.utils.rowcol_to_a1(1, inicio + len(faltantes) - 1)}",
+                [faltantes],
+            )
+    return aba
+
+
+def registros_historico(aba):
+    if aba is None:
+        return []
+    return aba.get_all_records(numericise_ignore=["all"])
+
+
+def limpar_rascunhos_expirados(aba):
+    if aba is None:
+        return
+    limite = datetime.now() - timedelta(days=30)
+    linhas = []
+    for numero_linha, registro in enumerate(registros_historico(aba), start=2):
+        if str(registro.get("Status", "")).strip() != "Rascunho":
+            continue
+        try:
+            atualizado = datetime.fromisoformat(str(registro.get("Atualizado Em", "")))
+        except ValueError:
+            continue
+        if atualizado < limite:
+            linhas.append(numero_linha)
+    for numero_linha in reversed(linhas):
+        aba.delete_rows(numero_linha)
+
+
+def atualizar_registro_historico(aba, numero_linha, registro):
+    valores = [registro.get(campo, "") for campo in HISTORY_HEADERS]
+    aba.update(
+        f"A{numero_linha}:{gspread.utils.rowcol_to_a1(numero_linha, len(HISTORY_HEADERS))}",
+        [valores],
+        value_input_option="USER_ENTERED",
+    )
+
+
+def salvar_no_historico(dados, rubricas, resultado, tipo_resultado, finalizar=False):
+    aba = aba_historico()
+    if aba is None:
+        st.warning("O cálculo foi realizado, mas o histórico ainda não está configurado neste aplicativo.")
+        return None
+
+    limpar_rascunhos_expirados(aba)
+    agora = datetime.now().isoformat(timespec="seconds")
+    registros = registros_historico(aba)
+    ativos = {str(item.get("ID", "")): (indice, item) for indice, item in enumerate(registros, start=2)}
+    ativo_id = st.session_state.get("enc_active_history_id")
+    origem_id = st.session_state.get("enc_source_history_id", "")
+
+    base = {
+        "Locador": dados["locador"],
+        "Locatário": dados["locatario"],
+        "Imóvel": dados["imovel"],
+        "Data Rescisão": data_para_texto(dados["dt_rescisao"]),
+        "Tipo Resultado": tipo_resultado,
+        "Resultado (R$)": resultado,
+        "Dados": json.dumps(dados, ensure_ascii=False, default=data_para_texto),
+        "Rubricas": json.dumps(rubricas, ensure_ascii=False),
+        "Atualizado Em": agora,
+    }
+
+    if ativo_id in ativos and str(ativos[ativo_id][1].get("Status", "")) == "Rascunho":
+        numero_linha, anterior = ativos[ativo_id]
+        registro = dict(anterior)
+        registro.update(base)
+        registro["Status"] = "Finalizado" if finalizar else "Rascunho"
+        registro["Expira Em"] = "" if finalizar else (datetime.now() + timedelta(days=30)).date().isoformat()
+        atualizar_registro_historico(aba, numero_linha, registro)
+        return registro["ID"]
+
+    origem = ativos.get(str(origem_id))
+    versao = 1
+    origem_raiz = ""
+    if origem:
+        numero_linha, anterior = origem
+        anterior_atualizado = dict(anterior)
+        anterior_atualizado["Status"] = "Substituído"
+        anterior_atualizado["Atualizado Em"] = agora
+        atualizar_registro_historico(aba, numero_linha, anterior_atualizado)
+        versao = int(str(anterior.get("Versão", "1") or "1")) + 1
+        origem_raiz = str(anterior.get("Origem ID") or anterior.get("ID") or "")
+
+    novo_id = uuid.uuid4().hex[:12].upper()
+    registro = {
+        "ID": novo_id,
+        "Versão": versao,
+        "Status": "Finalizado" if finalizar else "Rascunho",
+        "Criado Em": agora,
+        "Expira Em": "" if finalizar else (datetime.now() + timedelta(days=30)).date().isoformat(),
+        "Origem ID": origem_raiz,
+        **base,
+    }
+    aba.append_row([registro.get(campo, "") for campo in HISTORY_HEADERS], value_input_option="USER_ENTERED")
+    st.session_state["enc_active_history_id"] = novo_id
+    st.session_state["enc_source_history_id"] = ""
+    return novo_id
+
+
+def carregar_no_formulario(registro):
+    try:
+        dados = json.loads(str(registro.get("Dados", "{}")))
+    except (TypeError, json.JSONDecodeError):
+        dados = {}
+    for campo, valor in dados.items():
+        chave = f"enc_{campo}"
+        if campo.startswith("dt_"):
+            valor = texto_para_data(valor)
+        st.session_state[chave] = valor
+    st.session_state["enc_active_history_id"] = (
+        str(registro.get("ID", "")) if str(registro.get("Status", "")) == "Rascunho" else ""
+    )
+    st.session_state["enc_source_history_id"] = (
+        "" if str(registro.get("Status", "")) == "Rascunho" else str(registro.get("ID", ""))
+    )
+
+
+def limpar_formulario():
+    for campo in [
+        "locador", "imovel", "locatario", "iptu_num", "dt_inicio", "dt_fim", "dt_rescisao",
+        "aluguel", "tipo_aluguel", "status_aluguel", "modelo_ciclo_aluguel",
+        "dia_vencimento_aluguel", "vlr_condominio", "tipo_condominio", "status_condominio",
+        "aplicar_multa", "justificativa_multa", "iptu_anual", "iptu_pago", "cal_seguro",
+        "dt_seguro_inicio", "vlr_seguro_anual", "vlr_seguro_pago", "vlr_reparos",
+        "desc_extra1", "vlr_extra1", "desc_extra2", "vlr_extra2", "desc_extra3",
+        "vlr_extra3_val", "vlr_caucao", "salvar_historico", "finalizar_historico",
+    ]:
+        st.session_state.pop(f"enc_{campo}", None)
+    st.session_state.pop("enc_active_history_id", None)
+    st.session_state.pop("enc_source_history_id", None)
+
+
+def painel_historico():
+    aba = aba_historico()
+    st.subheader("🗂️ Histórico de Encerramentos")
+    if aba is None:
+        st.info("O histórico será ativado assim que a conexão segura com a planilha for configurada.")
+        return
+    limpar_rascunhos_expirados(aba)
+    registros = registros_historico(aba)
+    if not registros:
+        st.info("Ainda não há encerramentos salvos.")
+        return
+
+    registros = sorted(registros, key=lambda item: str(item.get("Atualizado Em", "")), reverse=True)
+    exibicao = [
+        {
+            "Data": str(item.get("Atualizado Em", "")).replace("T", " "),
+            "Status": item.get("Status", ""),
+            "Versão": item.get("Versão", ""),
+            "Imóvel": item.get("Imóvel", ""),
+            "Locatário": item.get("Locatário", ""),
+            "Resultado": format_money(item.get("Resultado (R$)", 0)),
+        }
+        for item in registros
+    ]
+    st.dataframe(exibicao, use_container_width=True, hide_index=True)
+    opcoes = {f"{item.get('Atualizado Em', '').replace('T', ' ')} — {item.get('Imóvel', '')} — {item.get('Locatário', '')} — v{item.get('Versão', 1)}": item for item in registros}
+    escolhido = st.selectbox("Abrir um encerramento", list(opcoes), key="enc_history_select")
+    registro = opcoes[escolhido]
+    if st.button("Abrir para conferir ou corrigir", type="primary"):
+        carregar_no_formulario(registro)
+        st.session_state["enc_view"] = "Novo cálculo"
+        st.rerun()
+
+
 st.set_page_config(page_title="Encerramento de Contrato", page_icon="📄", layout="wide")
 
 # Exibição da Logo da MRC (busca primeiro a imagem do repositório da intranet)
@@ -48,88 +279,107 @@ except Exception:
 st.title("📄 Painel de Encerramento de Contrato de Locação")
 st.write("Preencha os dados abaixo para calcular os valores, visualizar a prévia na tela e gerar o Termo em PDF.")
 
+if "enc_view" not in st.session_state:
+    st.session_state["enc_view"] = "Novo cálculo"
+esquerda, direita = st.columns([1, 1])
+with esquerda:
+    if st.button("🧮 Novo cálculo", use_container_width=True):
+        limpar_formulario()
+        st.session_state["enc_view"] = "Novo cálculo"
+        st.rerun()
+with direita:
+    if st.button("🗂️ Histórico", use_container_width=True):
+        st.session_state["enc_view"] = "Histórico"
+        st.rerun()
+
+if st.session_state["enc_view"] == "Histórico":
+    painel_historico()
+    st.stop()
+
 # Form de Entrada de Dados
 with st.form("form_encerramento"):
     st.subheader("1. Dados do Contrato e Partes")
     c1, c2 = st.columns(2)
     with c1:
-        locador = st.text_input("Nome do Locador", value="", placeholder="Digite o nome do locador")
-        imovel = st.text_input("Endereço do Imóvel", value="", placeholder="Digite o endereço completo do imóvel")
+        locador = st.text_input("Nome do Locador", placeholder="Digite o nome do locador", key="enc_locador")
+        imovel = st.text_input("Endereço do Imóvel", placeholder="Digite o endereço completo do imóvel", key="enc_imovel")
     with c2:
-        locatario = st.text_input("Nome do Locatário", value="", placeholder="Digite o nome do locatário")
-        iptu_num = st.text_input("Inscrição IPTU/TLP", value="", placeholder="Digite a inscrição do IPTU")
+        locatario = st.text_input("Nome do Locatário", placeholder="Digite o nome do locatário", key="enc_locatario")
+        iptu_num = st.text_input("Inscrição IPTU/TLP", placeholder="Digite a inscrição do IPTU", key="enc_iptu_num")
 
     st.subheader("2. Prazos e Aluguel Base")
     c3, c4, c5, c6 = st.columns(4)
     with c3:
-        dt_inicio = st.date_input("Data Início Contrato", value=None, format="DD/MM/YYYY", key="dt_inicio")
+        dt_inicio = st.date_input("Data Início Contrato", value=None, format="DD/MM/YYYY", key="enc_dt_inicio")
     with c4:
-        dt_fim = st.date_input("Data Fim Contrato (Obrigatória)", value=None, format="DD/MM/YYYY", key="dt_fim")
+        dt_fim = st.date_input("Data Fim Contrato (Obrigatória)", value=None, format="DD/MM/YYYY", key="enc_dt_fim")
     with c5:
-        dt_rescisao = st.date_input("Data Rescisão / Chaves (Obrigatória)", value=None, format="DD/MM/YYYY", key="dt_rescisao")
+        dt_rescisao = st.date_input("Data Rescisão / Chaves (Obrigatória)", value=None, format="DD/MM/YYYY", key="enc_dt_rescisao")
     with c6:
-        aluguel = st.number_input("Valor do Último Aluguel (R$)", value=0.0, min_value=0.0, step=100.0)
+        aluguel = st.number_input("Valor do Último Aluguel (R$)", value=0.0, min_value=0.0, step=100.0, key="enc_aluguel")
 
     st.subheader("3. Regras de Aluguel Proporcional, Condomínio e Multa")
     c7, c8, c9, c10 = st.columns(4)
     with c7:
-        tipo_aluguel = st.selectbox("Tipo do Aluguel", ["Vencido", "Vincendo"])
+        tipo_aluguel = st.selectbox("Tipo do Aluguel", ["Vencido", "Vincendo"], key="enc_tipo_aluguel")
     with c8:
-        status_aluguel = st.selectbox("Status Aluguel Mês Rescisão", ["Pago", "Não Pago"])
+        status_aluguel = st.selectbox("Status Aluguel Mês Rescisão", ["Pago", "Não Pago"], key="enc_status_aluguel")
     with c9:
-        modelo_ciclo_aluguel = st.selectbox("Modelo do Ciclo do Aluguel", ["Mês Fechado (01 a 30)", "Por Ciclo de Vencimento"])
+        modelo_ciclo_aluguel = st.selectbox("Modelo do Ciclo do Aluguel", ["Mês Fechado (01 a 30)", "Por Ciclo de Vencimento"], key="enc_modelo_ciclo_aluguel")
     with c10:
-        dia_vencimento_aluguel = st.number_input("Dia de Vencimento do Aluguel", value=5, min_value=1, max_value=31, step=1, help="Utilizado quando o ciclo não for Mês Fechado")
+        dia_vencimento_aluguel = st.number_input("Dia de Vencimento do Aluguel", value=5, min_value=1, max_value=31, step=1, help="Utilizado quando o ciclo não for Mês Fechado", key="enc_dia_vencimento_aluguel")
 
     st.markdown("---")
     c11, c12, c13, c14 = st.columns(4)
     with c11:
-        vlr_condominio = st.number_input("Valor Mensal Condomínio (R$)", value=0.0, min_value=0.0)
+        vlr_condominio = st.number_input("Valor Mensal Condomínio (R$)", value=0.0, min_value=0.0, key="enc_vlr_condominio")
     with c12:
-        tipo_condominio = st.selectbox("Tipo de Condomínio", ["Vincendo", "Vencido"])
+        tipo_condominio = st.selectbox("Tipo de Condomínio", ["Vincendo", "Vencido"], key="enc_tipo_condominio")
     with c13:
-        status_condominio = st.selectbox("Status Condomínio Mês Rescisão", ["Pago", "Não Pago"])
+        status_condominio = st.selectbox("Status Condomínio Mês Rescisão", ["Pago", "Não Pago"], key="enc_status_condominio")
     with c14:
-        aplicar_multa = st.checkbox("Aplicar Multa Rescisória?", value=False)
+        aplicar_multa = st.checkbox("Aplicar Multa Rescisória?", value=False, key="enc_aplicar_multa")
 
     justificativa_multa = st.text_input(
         "Justificativa para Isenção / Não Cobrança da Multa Rescisória",
-        value="",
-        placeholder="Obrigatório preencher caso o contrato ainda estivesse vigente e a multa não seja cobrada"
+        placeholder="Obrigatório preencher caso o contrato ainda estivesse vigente e a multa não seja cobrada",
+        key="enc_justificativa_multa"
     )
 
     st.subheader("4. IPTU/TLP e Seguro Incêndio")
     c15, c16 = st.columns(2)
     with c15:
-        iptu_anual = st.number_input("Valor IPTU+TLP Anual (R$)", value=0.0, min_value=0.0)
+        iptu_anual = st.number_input("Valor IPTU+TLP Anual (R$)", value=0.0, min_value=0.0, key="enc_iptu_anual")
     with c16:
-        iptu_pago = st.number_input("IPTU Já Pago Locatário (R$)", value=0.0, min_value=0.0)
+        iptu_pago = st.number_input("IPTU Já Pago Locatário (R$)", value=0.0, min_value=0.0, key="enc_iptu_pago")
 
     st.markdown("---")
     st.write("**Seguro Incêndio**")
-    cal_seguro = st.checkbox("Calcular Reembolso / Cobrança de Seguro Incêndio?", value=False)
+    cal_seguro = st.checkbox("Calcular Reembolso / Cobrança de Seguro Incêndio?", value=False, key="enc_cal_seguro")
     
     c17, c18, c19 = st.columns(3)
     with c17:
-        dt_seguro_inicio = st.date_input("Início do Ciclo do Seguro", value=None, format="DD/MM/YYYY", key="dt_seg_inicio")
+        dt_seguro_inicio = st.date_input("Início do Ciclo do Seguro", value=None, format="DD/MM/YYYY", key="enc_dt_seguro_inicio")
     with c18:
-        vlr_seguro_anual = st.number_input("Valor Seguro Anual (R$)", value=0.0, min_value=0.0)
+        vlr_seguro_anual = st.number_input("Valor Seguro Anual (R$)", value=0.0, min_value=0.0, key="enc_vlr_seguro_anual")
     with c19:
-        vlr_seguro_pago = st.number_input("Valor Seguro Pago pelo Locatário (R$)", value=0.0, min_value=0.0)
+        vlr_seguro_pago = st.number_input("Valor Seguro Pago pelo Locatário (R$)", value=0.0, min_value=0.0, key="enc_vlr_seguro_pago")
 
     st.subheader("5. Reparos, Outros Lançamentos e Caução")
     c20, c21 = st.columns(2)
     with c20:
-        vlr_reparos = st.number_input("Reparos / Danos Imóvel (R$)", value=0.0, min_value=0.0)
-        desc_extra1 = st.text_input("Outros 1 - Descrição", value="", placeholder="Ex: Pintura")
-        vlr_extra1 = st.number_input("Outros 1 - Valor (R$)", value=0.0, min_value=0.0)
-        desc_extra2 = st.text_input("Outros 2 - Descrição", value="", placeholder="Ex: Troca de Fechadura")
-        vlr_extra2 = st.number_input("Outros 2 - Valor (R$)", value=0.0, min_value=0.0)
+        vlr_reparos = st.number_input("Reparos / Danos Imóvel (R$)", value=0.0, min_value=0.0, key="enc_vlr_reparos")
+        desc_extra1 = st.text_input("Outros 1 - Descrição", placeholder="Ex: Pintura", key="enc_desc_extra1")
+        vlr_extra1 = st.number_input("Outros 1 - Valor (R$)", value=0.0, min_value=0.0, key="enc_vlr_extra1")
+        desc_extra2 = st.text_input("Outros 2 - Descrição", placeholder="Ex: Troca de Fechadura", key="enc_desc_extra2")
+        vlr_extra2 = st.number_input("Outros 2 - Valor (R$)", value=0.0, min_value=0.0, key="enc_vlr_extra2")
     with c21:
-        desc_extra3 = st.text_input("Outros 3 - Descrição", value="", placeholder="Ex: Limpeza")
-        vlr_extra3_val = st.number_input("Outros 3 - Valor (R$)", value=0.0, min_value=0.0)
-        vlr_caucao = st.number_input("Valor Caução Depositada (R$)", value=0.0, min_value=0.0)
+        desc_extra3 = st.text_input("Outros 3 - Descrição", placeholder="Ex: Limpeza", key="enc_desc_extra3")
+        vlr_extra3_val = st.number_input("Outros 3 - Valor (R$)", value=0.0, min_value=0.0, key="enc_vlr_extra3_val")
+        vlr_caucao = st.number_input("Valor Caução Depositada (R$)", value=0.0, min_value=0.0, key="enc_vlr_caucao")
 
+    salvar_historico = st.checkbox("Salvar no histórico", value=True, key="enc_salvar_historico")
+    finalizar_historico = st.checkbox("Marcar este encerramento como finalizado", value=False, key="enc_finalizar_historico")
     btn_calcular = st.form_submit_button("🚀 Calcular e Visualizar Acerto", type="primary")
 
 # Validação e Processamento dos Cálculos
@@ -295,6 +545,36 @@ if btn_calcular:
 
         total_debitos = sum(item["valor"] for item in itens_financeiros)
         saldo_final = total_debitos - vlr_caucao
+
+        if salvar_historico:
+            dados_historico = {
+                "locador": locador, "imovel": imovel, "locatario": locatario, "iptu_num": iptu_num,
+                "dt_inicio": data_para_texto(dt_inicio), "dt_fim": data_para_texto(dt_fim),
+                "dt_rescisao": data_para_texto(dt_rescisao), "aluguel": aluguel,
+                "tipo_aluguel": tipo_aluguel, "status_aluguel": status_aluguel,
+                "modelo_ciclo_aluguel": modelo_ciclo_aluguel,
+                "dia_vencimento_aluguel": dia_vencimento_aluguel, "vlr_condominio": vlr_condominio,
+                "tipo_condominio": tipo_condominio, "status_condominio": status_condominio,
+                "aplicar_multa": aplicar_multa, "justificativa_multa": justificativa_multa,
+                "iptu_anual": iptu_anual, "iptu_pago": iptu_pago, "cal_seguro": cal_seguro,
+                "dt_seguro_inicio": data_para_texto(dt_seguro_inicio),
+                "vlr_seguro_anual": vlr_seguro_anual, "vlr_seguro_pago": vlr_seguro_pago,
+                "vlr_reparos": vlr_reparos, "desc_extra1": desc_extra1, "vlr_extra1": vlr_extra1,
+                "desc_extra2": desc_extra2, "vlr_extra2": vlr_extra2,
+                "desc_extra3": desc_extra3, "vlr_extra3_val": vlr_extra3_val, "vlr_caucao": vlr_caucao,
+            }
+            if saldo_final > 0:
+                tipo_resultado = "A cobrar"
+            elif saldo_final < 0:
+                tipo_resultado = "A devolver"
+            else:
+                tipo_resultado = "Quitado"
+            identificador = salvar_no_historico(
+                dados_historico, itens_financeiros, saldo_final, tipo_resultado, finalizar_historico
+            )
+            if identificador:
+                situacao = "finalizado" if finalizar_historico else "salvo como rascunho"
+                st.success(f"Encerramento {situacao} no histórico (ID {identificador}).")
 
         # Prévia na Tela com Parâmetros de Auditagem
         st.markdown("---")
