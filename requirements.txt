@@ -1,3 +1,5 @@
 streamlit
 openpyxl
 fpdf2
+gspread
+google-auth
