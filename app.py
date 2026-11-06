@@ -370,12 +370,12 @@ with st.form("form_encerramento"):
     with c20:
         vlr_reparos = st.number_input("Reparos / Danos Imóvel (R$)", value=0.0, min_value=0.0, key="enc_vlr_reparos")
         desc_extra1 = st.text_input("Outros 1 - Descrição", placeholder="Ex: Pintura", key="enc_desc_extra1")
-        vlr_extra1 = st.number_input("Outros 1 - Valor (R$)", value=0.0, min_value=0.0, key="enc_vlr_extra1")
+        vlr_extra1 = st.number_input("Outros 1 - Valor (R$)", value=0.0, help="Use valor negativo para reembolso ao locatário.", key="enc_vlr_extra1")
         desc_extra2 = st.text_input("Outros 2 - Descrição", placeholder="Ex: Troca de Fechadura", key="enc_desc_extra2")
-        vlr_extra2 = st.number_input("Outros 2 - Valor (R$)", value=0.0, min_value=0.0, key="enc_vlr_extra2")
+        vlr_extra2 = st.number_input("Outros 2 - Valor (R$)", value=0.0, help="Use valor negativo para reembolso ao locatário.", key="enc_vlr_extra2")
     with c21:
         desc_extra3 = st.text_input("Outros 3 - Descrição", placeholder="Ex: Limpeza", key="enc_desc_extra3")
-        vlr_extra3_val = st.number_input("Outros 3 - Valor (R$)", value=0.0, min_value=0.0, key="enc_vlr_extra3_val")
+        vlr_extra3_val = st.number_input("Outros 3 - Valor (R$)", value=0.0, help="Use valor negativo para reembolso ao locatário.", key="enc_vlr_extra3_val")
         vlr_caucao = st.number_input("Valor Caução Depositada (R$)", value=0.0, min_value=0.0, key="enc_vlr_caucao")
 
     salvar_historico = st.checkbox("Salvar no histórico", value=True, key="enc_salvar_historico")
@@ -536,11 +536,11 @@ if btn_calcular:
         # Reparos e Outros Lançamentos Extras
         if vlr_reparos > 0:
             itens_financeiros.append({"nome": "Reparos / Danos no Imovel", "valor": vlr_reparos})
-        if vlr_extra1 > 0:
+        if vlr_extra1 != 0:
             itens_financeiros.append({"nome": desc_extra1 or "Outros Lancamentos 1", "valor": vlr_extra1})
-        if vlr_extra2 > 0:
+        if vlr_extra2 != 0:
             itens_financeiros.append({"nome": desc_extra2 or "Outros Lancamentos 2", "valor": vlr_extra2})
-        if vlr_extra3_val > 0:
+        if vlr_extra3_val != 0:
             itens_financeiros.append({"nome": desc_extra3 or "Outros Lancamentos 3", "valor": vlr_extra3_val})
 
         total_debitos = sum(item["valor"] for item in itens_financeiros)
@@ -625,9 +625,9 @@ if btn_calcular:
             col_c1, col_c2 = st.columns(2)
             with col_c1:
                 st.write(f"• **Reparos / Danos:** {format_money(vlr_reparos)}")
-                if vlr_extra1 > 0: st.write(f"• **{desc_extra1 or 'Outros 1'}:** {format_money(vlr_extra1)}")
-                if vlr_extra2 > 0: st.write(f"• **{desc_extra2 or 'Outros 2'}:** {format_money(vlr_extra2)}")
-                if vlr_extra3_val > 0: st.write(f"• **{desc_extra3 or 'Outros 3'}:** {format_money(vlr_extra3_val)}")
+                if vlr_extra1 != 0: st.write(f"• **{desc_extra1 or 'Outros 1'}:** {format_money(vlr_extra1)}")
+                if vlr_extra2 != 0: st.write(f"• **{desc_extra2 or 'Outros 2'}:** {format_money(vlr_extra2)}")
+                if vlr_extra3_val != 0: st.write(f"• **{desc_extra3 or 'Outros 3'}:** {format_money(vlr_extra3_val)}")
             with col_c2:
                 st.write(f"• **Caução Depositada:** {format_money(vlr_caucao)}")
 
